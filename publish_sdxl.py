@@ -9,12 +9,16 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+from tempfile import TemporaryDirectory
 
 from huggingface_hub import CommitOperationAdd, HfApi
+from huggingface_hub.utils import get_session, hf_raise_for_status
 
 
 MODEL_ID = r"ntc-ai/SDXL-LoRA-slider\.[A-Za-z0-9][A-Za-z0-9_.-]{0,90}"
 GIT_SHA = r"[0-9a-f]{40}"
+HUB = "https://huggingface.co"
+SOURCE = "ntc-ai/lora_eval"
 
 
 @dataclass(frozen=True)
@@ -46,8 +50,8 @@ def load_manifest(path):
     if (not isinstance(target, str) or not re.fullmatch(MODEL_ID, target)
             or not isinstance(parent, str) or not re.fullmatch(GIT_SHA, parent)):
         raise ValueError(f"Invalid SDXL model or Hub parent in {path}")
-    if not isinstance(files, list) or not files:
-        raise ValueError(f"No release files in {path}")
+    if not isinstance(files, list):
+        raise ValueError(f"Expected a release file list in {path}")
 
     root = path.parent.resolve()
     payload = {}
@@ -80,29 +84,42 @@ def matches(remote_file, local):
     return remote_file.blob_id == local.git_blob
 
 
-def release(target, parent, payload, api, *, apply=False, source_sha=None):
+def identity(file):
+    return file.size, file.lfs.sha256 if file.lfs else file.blob_id
+
+
+def release(target, parent, payload, api, *, writer=None, source_sha=None):
     current = api.model_info(target, revision="main", files_metadata=True)
     if current.id != target or current.private or current.disabled:
         raise ValueError(f"Expected an existing public model at {target}")
     remote = {f.rfilename: f for f in current.siblings}
     changes = [file for path, file in payload.items() if not matches(remote.get(path), file)]
-    if not changes:
+    if payload and not changes:
         return {"target": target, "revision": current.sha, "status": "unchanged"}
     if current.sha != parent:
         raise ValueError(f"{target} moved from the reviewed parent {parent} to {current.sha}")
-    if not apply:
+    if not payload:
+        return {"target": target, "revision": current.sha, "status": "baseline"}
+    if writer is None:
         return {"target": target, "revision": parent, "status": "planned",
                 "changed": [file.target_path for file in changes]}
 
     operations = [CommitOperationAdd(path_in_repo=file.target_path, path_or_fileobj=file.data) for file in changes]
-    commit = api.create_commit(target, operations, revision="main", parent_commit=parent,
-                               commit_message=f"Publish reviewed SDXL files from Git {source_sha}")
-    published = api.model_info(target, revision=commit.oid, files_metadata=True)
+    commit = writer.create_commit(target, operations, revision="main", parent_commit=parent,
+                                  commit_message=f"Publish reviewed SDXL files from Git {source_sha}")
+    published = api.model_info(target, revision="main", files_metadata=True)
     files = {f.rfilename: f for f in published.siblings}
     if published.sha != commit.oid or any(not matches(files.get(path), file) for path, file in payload.items()):
         raise RuntimeError(f"Published files did not match the reviewed manifest at {commit.oid}")
     if not remote.keys() <= files.keys():
         raise RuntimeError(f"The published revision {commit.oid} is missing existing files")
+    updated_paths = {file.target_path for file in changes}
+    if (
+        files.keys() - remote.keys() - updated_paths - {".gitattributes"}
+        or any(identity(files[path]) != identity(remote[path])
+               for path in remote.keys() - updated_paths - {".gitattributes"})
+    ):
+        raise RuntimeError(f"The published revision {commit.oid} contains unreviewed changes")
     return {"target": target, "revision": commit.oid, "status": "published", "source": source_sha}
 
 
@@ -122,6 +139,43 @@ def git_changes(before):
     return sorted(directories)
 
 
+def github_source_revision():
+    if (
+        os.getenv("GITHUB_ACTIONS") != "true" or os.getenv("GITHUB_REPOSITORY") != SOURCE
+        or os.getenv("GITHUB_EVENT_NAME") != "push" or os.getenv("GITHUB_REF") != "refs/heads/master"
+    ):
+        raise ValueError("Publishing requires the canonical GitHub workflow on master")
+    sha = os.environ.get("GITHUB_SHA", "")
+    checkout = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    if not re.fullmatch(GIT_SHA, sha) or checkout != sha:
+        raise ValueError("The checked-out commit must match the GitHub release event")
+    return sha
+
+
+def publisher(target):
+    if not re.fullmatch(MODEL_ID, target):
+        raise ValueError("Expected a single SDXL model to publish")
+    # Obtain a fresh credential for this target only. A clean HF home avoids
+    # accidentally reusing a local or shared login.
+    with TemporaryDirectory() as cache:
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_TOKEN_PATH", "HF_OIDC_ID_TOKEN"}}
+        env.update(HF_HOME=cache, HF_OIDC_RESOURCE=target, HF_ENDPOINT=HUB)
+        exchanged = subprocess.run(["hf", "auth", "token"], env=env, capture_output=True, text=True, timeout=30)
+    token = exchanged.stdout.strip()
+    if exchanged.returncode or not re.fullmatch(r"hf_jwt_[A-Za-z0-9_.-]+", token):
+        raise RuntimeError(f"Failed to obtain a short-lived publisher credential for {target}")
+    print(f"::add-mask::{token}", flush=True)
+    response = get_session().post(f"{HUB}/api/models/{target}/preupload/main", timeout=20,
+                                  headers={"Authorization": f"Bearer {token}"}, json={"files": []})
+    hf_raise_for_status(response)
+    preflight_sha = response.json()["commitOid"]
+    if not re.fullmatch(GIT_SHA, preflight_sha):
+        raise RuntimeError(f"Unexpected upload preflight revision for {target}")
+    print(f"Verified upload preflight for {target} at {preflight_sha}", flush=True)
+    return HfApi(endpoint=HUB, token=token)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -129,14 +183,8 @@ def main():
     source.add_argument("--changed-from", help="Select directories changed since this Git revision")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
-    if args.apply:
-        token = os.environ.get("HF_SDXL_MODEL_TOKEN")
-        if not token:
-            parser.error("Publishing requires the scoped HF_SDXL_MODEL_TOKEN")
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    else:
-        token, sha = False, None
-    api = HfApi(token=token)
+    sha = github_source_revision() if args.apply else None
+    api = HfApi(endpoint=HUB, token=False)
     if args.manifest:
         manifests = [args.manifest]
     else:
@@ -151,8 +199,12 @@ def main():
     releases = [load_manifest(manifest) for manifest in manifests]
     if len(releases) != len({target for target, _, _ in releases}):
         raise ValueError("Select one manifest per model in each release")
-    for target, parent, payload in releases:
-        result = release(target, parent, payload, api, apply=args.apply, source_sha=sha)
+    plans = [release(target, parent, payload, api) for target, parent, payload in releases]
+    for (target, parent, payload), plan in zip(releases, plans, strict=True):
+        result = plan
+        if args.apply:
+            writer = publisher(target)
+            result = release(target, parent, payload, api, writer=writer, source_sha=sha)
         print(json.dumps(result), flush=True)
 
 

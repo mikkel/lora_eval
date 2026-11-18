@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from publish_sdxl import Payload, git_changes, load_manifest, release
+from publish_sdxl import Payload, github_source_revision, git_changes, load_manifest, publisher, release
 
 
 TARGET = "ntc-ai/SDXL-LoRA-slider.Example"
@@ -48,8 +48,9 @@ class ReleaseTests(unittest.TestCase):
             }],
         }
         self.api = Mock()
+        self.writer = Mock()
         self.api.model_info.return_value = model_info(PARENT, self.old_card)
-        self.api.create_commit.return_value = SimpleNamespace(oid=REVISION)
+        self.writer.create_commit.return_value = SimpleNamespace(oid=REVISION)
 
     def read_manifest(self):
         self.manifest.write_text(json.dumps(self.spec))
@@ -71,11 +72,11 @@ class ReleaseTests(unittest.TestCase):
             model_info(PARENT, self.old_card),
             model_info(REVISION, self.old_card, released_weight),
         ]
-        result = self.run_release(apply=True, source_sha="2" * 40)
+        result = self.run_release(writer=self.writer, source_sha="2" * 40)
         self.assertEqual(result["revision"], REVISION)
         self.assertEqual(result["status"], "published")
-        self.api.create_commit.assert_called_once()
-        args, kwargs = self.api.create_commit.call_args
+        self.writer.create_commit.assert_called_once()
+        args, kwargs = self.writer.create_commit.call_args
         target, operations = args
         self.assertEqual(target, TARGET)
         self.assertEqual(kwargs["parent_commit"], PARENT)
@@ -83,7 +84,8 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(operations), 1)
         self.assertEqual(operations[0].path_in_repo, "slider.safetensors")
         self.assertEqual(operations[0].path_or_fileobj, self.weight)
-        self.api.model_info.assert_called_with(TARGET, revision=REVISION, files_metadata=True)
+        self.api.model_info.assert_called_with(TARGET, revision="main", files_metadata=True)
+        self.api.create_commit.assert_not_called()
 
     def test_identical_payload_is_a_noop_with_either_storage_type(self):
         for lfs in (True, False):
@@ -91,37 +93,76 @@ class ReleaseTests(unittest.TestCase):
                 self.api.model_info.return_value = model_info(
                     REVISION, self.old_card, metadata("slider.safetensors", self.weight, lfs=lfs)
                 )
-                self.assertEqual(self.run_release(apply=True)["status"], "unchanged")
-        self.api.create_commit.assert_not_called()
+                self.assertEqual(self.run_release(writer=self.writer)["status"], "unchanged")
+        self.writer.create_commit.assert_not_called()
 
     def test_changed_payload_requires_current_reviewed_parent(self):
         self.api.model_info.return_value = model_info(REVISION, self.old_card)
         with self.assertRaisesRegex(ValueError, "moved from the reviewed parent"):
-            self.run_release(apply=True)
-        self.api.create_commit.assert_not_called()
+            self.run_release(writer=self.writer)
+        self.writer.create_commit.assert_not_called()
 
     def test_verification_detects_a_lost_file_or_unexpected_bytes(self):
         for files, error in (
             ((metadata("slider.safetensors", self.weight),), "missing existing files"),
             ((self.old_card, metadata("slider.safetensors", b"wrong data")), "did not match"),
+            ((metadata("README.md", b"other card"), metadata("slider.safetensors", self.weight)), "unreviewed changes"),
         ):
             with self.subTest(error=error):
                 self.api.model_info.side_effect = [
                     model_info(PARENT, self.old_card), model_info(REVISION, *files)
                 ]
                 with self.assertRaisesRegex(RuntimeError, error):
-                    self.run_release(apply=True)
+                    self.run_release(writer=self.writer)
 
     def test_private_and_outside_namespace_models_are_rejected(self):
         private = model_info(PARENT)
         private.private = True
         self.api.model_info.return_value = private
         with self.assertRaisesRegex(ValueError, "existing public model"):
-            self.run_release(apply=True)
+            self.run_release(writer=self.writer)
         self.spec["target"] = "other/SDXL-LoRA-slider.Example"
         with self.assertRaisesRegex(ValueError, "Invalid SDXL model"):
-            self.run_release(apply=True)
-        self.api.create_commit.assert_not_called()
+            self.run_release(writer=self.writer)
+        self.writer.create_commit.assert_not_called()
+
+    def test_baseline_verifies_exact_parent_without_writing(self):
+        self.spec["files"] = []
+        self.assertEqual(self.run_release(writer=self.writer),
+                         {"target": TARGET, "revision": PARENT, "status": "baseline"})
+        self.api.model_info.return_value = model_info(REVISION, self.old_card)
+        with self.assertRaisesRegex(ValueError, "moved from the reviewed parent"):
+            self.run_release(writer=self.writer)
+        self.writer.create_commit.assert_not_called()
+
+    def test_write_context_requires_the_canonical_repository_and_checkout(self):
+        context = {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "ntc-ai/lora_eval",
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/master", "GITHUB_SHA": REVISION}
+        with patch.dict("publish_sdxl.os.environ", context, clear=True), \
+                patch("publish_sdxl.subprocess.check_output", return_value=REVISION + "\n"):
+            self.assertEqual(github_source_revision(), REVISION)
+            with patch.dict("publish_sdxl.os.environ", {"GITHUB_REPOSITORY": "fork/lora_eval"}):
+                with self.assertRaisesRegex(ValueError, "canonical GitHub workflow"):
+                    github_source_revision()
+            with patch.dict("publish_sdxl.os.environ", {"GITHUB_SHA": PARENT}):
+                with self.assertRaisesRegex(ValueError, "checked-out commit"):
+                    github_source_revision()
+
+    def test_publisher_overrides_other_scopes_and_uses_the_upload_preflight(self):
+        env = {"HF_TOKEN": "local-test-token", "HF_OIDC_RESOURCE": "other/model"}
+        with patch.dict("publish_sdxl.os.environ", env, clear=True), \
+                patch("publish_sdxl.subprocess.run", return_value=SimpleNamespace(stdout="hf_jwt_test\n", returncode=0)) as run, \
+                patch("publish_sdxl.get_session") as session, patch("publish_sdxl.hf_raise_for_status"), \
+                patch("builtins.print"):
+            session.return_value.post.return_value.json.return_value = {"commitOid": REVISION}
+            self.assertEqual(publisher(TARGET).token, "hf_jwt_test")
+            exchanged = run.call_args.kwargs["env"]
+            self.assertEqual(exchanged["HF_OIDC_RESOURCE"], TARGET)
+            self.assertNotIn("HF_TOKEN", exchanged)
+            session.return_value.post.assert_called_once_with(
+                f"https://huggingface.co/api/models/{TARGET}/preupload/main", timeout=20,
+                headers={"Authorization": "Bearer hf_jwt_test"}, json={"files": []},
+            )
 
     def test_hash_mismatch_is_rejected(self):
         self.spec["files"][0]["sha256"] = "f" * 64
