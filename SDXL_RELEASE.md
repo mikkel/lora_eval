@@ -23,9 +23,10 @@ when its manifest is merged to `master`.
    | `event_name` | `push` |
    | `runner_environment` | `github-hosted` |
 
-3. Merge the checked PR. Its starter manifest verifies the Chiaroscuro revision
-   and the model-scoped upload preflight. An empty `files` list checks the exact
-   parent and results in a `baseline` report without a Hub commit.
+3. Merge the checked PR. Its first release points the Chiaroscuro card thumbnail
+   to an image already in the published model. Verify the exact new card and
+   the retained weight digest. An empty `files` list is available for checking
+   a model's parent and upload permission before preparing a changed release.
 4. Add the same GitHub claim policy on each additional public model when its
    reviewed release is ready. Each policy belongs to the exact model named in
    the manifest. Private repositories use their separate release process.
